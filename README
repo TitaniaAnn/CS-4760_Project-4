@@ -1,6 +1,6 @@
 Name: Cynthia Brown
 Date: 2026-04-07
-Environment: Linux (hoare.cs.umsl.edu), gcc, VS Code
+Environment: Linux (opsys.cs.umsl.edu), gcc, VS Code
 
 How to compile the project:
     Type 'make'
