@@ -1,0 +1,105 @@
+Name: Cynthia Brown
+Date: 2026-04-07
+Environment: Linux (hoare.cs.umsl.edu), gcc, VS Code
+
+How to compile the project:
+    Type 'make'
+
+Example of how to run the project:
+    ./oss -n 3 -s 2 -t 4 -i 0.6 -f log.txt
+
+Command-line options:
+    -h              Print help and exit
+    -n proc         Total number of user processes to launch (default 5)
+    -s simul        Maximum simultaneous processes, up to 18 (default 3)
+    -t timelimit    Upper bound in seconds for each process's CPU burst (default 4)
+    -i interval     Minimum fractional seconds between child launches (default 0.5)
+    -f logfile      Output log file name (default log.txt)
+
+Generative AI used: Claude (Anthropic)
+
+Prompts:
+    /init
+    Based on the requirements lets make a plan on how to implement this project
+    Lets execute the plan
+
+Summary: Claude Code was used to generate the full implementation plan and all
+source files (shared.h, oss.c, user.c, Makefile) for this project. The generated
+code correctly models the round-robin scheduling loop, shared memory clock,
+message queue dispatch/reply protocol, blocked queue with 100ms I/O delay,
+and SIGINT cleanup. Some minor tuning (overhead values, edge-case clock math)
+was reviewed and adjusted after generation. Overall the AI assistance was very
+useful for quickly scaffolding the IPC structure and scheduling logic, though
+careful review was still needed to ensure correctness of the message protocol
+and termination logic.
+
+Implementation Plan:
+
+  Phase 1 - Shared Infrastructure (shared.h + Makefile)
+    - struct PCB (as spec'd), struct SharedData (clock + process table),
+      struct Message (mtype + value)
+    - Constants: BASE_QUANTUM_NS=25000000, MAX_PROCS=20, SHM_KEY, MSG_KEY
+    - Makefile with suffix rules, builds both oss and user
+
+  Phase 2 - OSS Skeleton + One Child (IPC proof of concept)
+    oss.c:
+    - Parse args (-h -n -s -t -i -f)
+    - Set up shared memory for SharedData, set up message queue
+    - Register SIGINT handler -> cleanup (removes shm + msgq, kills children)
+    - Fork one user process, fill its PCB, add to ready queue
+    - Send it one quantum via msgsnd, msgrcv the reply, log it
+    user.c:
+    - Attach to shared memory (read-only clock access)
+    - Seed srand with getpid() for unique per-process seeds
+    - Receive message from OSS (mtype = own pid), send reply (mtype = 1)
+
+  Phase 3 - Full Scheduling Loop (multiple processes, round-robin)
+    oss.c main loop:
+    1. Maybe fork a new child (check simul limit, launch interval, wall clock)
+    2. Check blocked queue -- unblock any whose eventWaitSec:Nano <= clock
+    3. If ready queue non-empty:
+         - log ready queue
+         - dispatch front (msgsnd), add small scheduling overhead to clock
+         - msgrcv reply; interpret: terminated / blocked / full quantum
+         - update PCB serviceTime, advance clock by time used, re-queue or remove
+    4. Else (no ready processes): advance clock to next launch time
+    5. Every 0.5 sim-seconds: print process table to log + screen
+    6. Check wall clock -- terminate if > 3 real seconds
+    Process launch: track nextLaunchSec/Nano, only fork if clock >= nextLaunch
+    and activeCount < s and launched < n; cpuBurst = random 0..t seconds
+
+  Phase 4 - User Process Decision Logic
+    Each time user receives a quantum:
+    1. If totalServiceTime + quantum >= cpuBurst -> terminate: send -(remaining)
+    2. Else roll 20% chance for I/O block:
+         Blocked:   pick random 1-99% of quantum, send that value positive
+         Full run:  send full quantum value positive
+    OSS on reply:
+         Negative          -> clear PCB, waitpid, decrement active, advance clock
+         Positive < quantum -> blocked: set eventWaitSec/Nano = clock + 100ms
+         Positive == quantum -> full run: push back to end of ready queue
+
+  Phase 5 - Statistics & Final Report
+    Track in OSS:
+    - totalCpuNs:  sum of all values received from processes (actual running time)
+    - totalOssNs:  time OSS incremented for its own overhead
+    - totalClockNs: final clock value at termination
+    Print at end:
+    - Simulated clock at exit, total launched/finished
+    - Total CPU time, OSS overhead time
+    - CPU utilization = totalCpuNs / totalClockNs * 100%
+
+  Key Details:
+    Message targeting:  mtype = child_pid (OSS->child); mtype = 1 (child->OSS)
+    Clock overflow:     normalize ns >= 1e9 into seconds on every add
+    cpuBurst storage:   parallel arrays burstSec[20]/burstNano[20] in OSS
+    Zombie prevention:  waitpid(pid, NULL, 0) after termination reply
+    Wall-clock timeout: time(NULL) compared to start time each iteration
+    Log line cap:       stop writing at 10000 lines, keep simulating
+    Process table print: every 500ms simulated time via lastPrintSec tracking
+
+Notes: I am using Claude Code and with this project I created a project specific agent
+using the /init command with the project 4 specs pdf already added to the project folder.
+This sped things up a lot. The /init took about 3 min to run and then the planning stage
+took less then 2 min. The execution of the plan took about 5 mins. So then I just had to 
+review the code and test.
