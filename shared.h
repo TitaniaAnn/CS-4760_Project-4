@@ -15,12 +15,12 @@
 
 /* Scheduling constants */
 #define BASE_QUANTUM_NS  25000000   /* 25 ms in nanoseconds */
-#define MAX_PROCS        20
+#define MAX_PROCS        18         /* spec: up to 18 PCBs */
 #define MAX_SIMUL        18
 #define BLOCK_DURATION_NS 100000000 /* 100 ms blocked duration */
 #define NS_PER_SEC       1000000000UL
 
-/* Process Control Block */
+/* Process Control Block — lives in OSS main memory only, not shared memory */
 struct PCB {
     int  occupied;           /* 1 if slot is in use */
     pid_t pid;               /* actual pid of child */
@@ -33,11 +33,10 @@ struct PCB {
     int  blocked;            /* 1 if waiting on I/O event */
 };
 
-/* Shared memory layout: clock + process table */
+/* Shared memory layout: clock only (children may read the clock) */
 struct SharedData {
     unsigned int seconds;
     unsigned int nanoseconds;
-    struct PCB   processTable[MAX_PROCS];
 };
 
 /* Message queue format.

@@ -69,10 +69,11 @@ int main(int argc, char *argv[]) {
         long remainTotal = remainSec * (long)NS_PER_SEC + remainNano;
 
         /* --- Option 3: terminate if quantum would exceed remaining burst --- */
-        if (quantum >= remainTotal) {
-            /* Use only what remains, then terminate */
-            msg.mtype = 1; /* back to oss */
-            msg.value = -remainTotal; /* negative = terminating */
+        if (remainTotal <= 0 || quantum >= remainTotal) {
+            /* Use only what remains (at least 1ns), then terminate */
+            long used = (remainTotal > 0) ? remainTotal : 1;
+            msg.mtype = 1;
+            msg.value = -used; /* negative = terminating */
             msgsnd(msgid, &msg, sizeof(long), 0);
             break;
         }

@@ -102,4 +102,4 @@ Notes: I am using Claude Code and with this project I created a project specific
 using the /init command with the project 4 specs pdf already added to the project folder.
 This sped things up a lot. The /init took about 3 min to run and then the planning stage
 took less then 2 min. The execution of the plan took about 5 mins. So then I just had to 
-review the code and test.
+review the code as it was suggested and test.

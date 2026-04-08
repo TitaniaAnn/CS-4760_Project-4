@@ -20,11 +20,14 @@
 #include "shared.h"
 
 /* -------------------------------------------------------------------------
- * Globals for IPC cleanup
+ * Globals for IPC cleanup and process table
  * ---------------------------------------------------------------------- */
 static int  shmid  = -1;
 static int  msgid  = -1;
 static struct SharedData *shm = NULL;
+
+/* Process table lives in OSS local memory — not in shared memory */
+static struct PCB processTable[MAX_PROCS];
 
 /* -------------------------------------------------------------------------
  * Queue helpers (circular array, capacity = MAX_PROCS)
@@ -74,17 +77,24 @@ static int   log_lines  = 0;
 #define MAX_LOG_LINES 10000
 
 static void logprint(const char *fmt, ...) {
+    /* Count newlines in fmt to accurately track log lines */
+    int newlines = 0;
+    for (const char *p = fmt; *p; p++)
+        if (*p == '\n') newlines++;
+
     va_list ap;
     if (logfp && log_lines < MAX_LOG_LINES) {
         va_start(ap, fmt);
         vfprintf(logfp, fmt, ap);
         va_end(ap);
-        log_lines++;
+        log_lines += (newlines > 0 ? newlines : 1);
     }
-    /* Also echo to stdout */
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
+    /* Also echo to stdout (same cap so it doesn't flood) */
+    if (log_lines < MAX_LOG_LINES) {
+        va_start(ap, fmt);
+        vprintf(fmt, ap);
+        va_end(ap);
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -99,7 +109,10 @@ static void cleanup(void) {
 
 static void signal_handler(int sig) {
     (void)sig;
-    /* Kill entire process group so all forked children die */
+    /* Ignore SIGTERM on self before broadcasting so we don't re-enter */
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT,  SIG_IGN);
+    /* Kill all children in the process group */
     kill(-getpgrp(), SIGTERM);
     /* Reap children */
     while (waitpid(-1, NULL, WNOHANG) > 0) {}
@@ -116,7 +129,7 @@ static void print_process_table(void) {
     logprint("  %-4s %-8s %-10s %-10s %-8s\n",
              "Slot", "PID", "StartSec", "SvcTime(s)", "Blocked");
     for (int i = 0; i < MAX_PROCS; i++) {
-        struct PCB *p = &shm->processTable[i];
+        struct PCB *p = &processTable[i];
         if (!p->occupied) continue;
         double svc = p->serviceTimeSeconds +
                      p->serviceTimeNano / 1e9;
@@ -133,7 +146,7 @@ static void print_ready_queue(Queue *rq) {
     logprint("OSS: Ready queue [");
     for (int i = 0; i < rq->size; i++) {
         int idx = rq->data[(rq->head + i) % MAX_PROCS];
-        logprint(" P%d", shm->processTable[idx].pid);
+        logprint(" P%d", processTable[idx].pid);
     }
     logprint(" ]\n");
 }
@@ -143,7 +156,7 @@ static void print_ready_queue(Queue *rq) {
  * ---------------------------------------------------------------------- */
 static int find_free_slot(void) {
     for (int i = 0; i < MAX_PROCS; i++)
-        if (!shm->processTable[i].occupied) return i;
+        if (!processTable[i].occupied) return i;
     return -1;
 }
 
@@ -197,6 +210,9 @@ int main(int argc, char *argv[]) {
     /* --- Message queue --- */
     msgid = msgget(MSG_KEY, IPC_CREAT | 0666);
     if (msgid == -1) { perror("msgget"); cleanup(); return 1; }
+
+    /* Process table already declared as static global — zero it out */
+    memset(processTable, 0, sizeof(processTable));
 
     /* --- Queues --- */
     Queue readyQ, blockedQ;
@@ -277,7 +293,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 /* Parent: fill PCB */
-                struct PCB *p = &shm->processTable[slot];
+                struct PCB *p = &processTable[slot];
                 memset(p, 0, sizeof(struct PCB));
                 p->occupied    = 1;
                 p->pid         = pid;
@@ -297,10 +313,13 @@ int main(int argc, char *argv[]) {
                 clock_add(&shm->seconds, &shm->nanoseconds, overhead);
                 totalOssNs += overhead;
 
-                /* Schedule next launch: current_clock + rand(0, i_inter) sec */
-                unsigned long interval_ns =
-                    (unsigned long)((double)rand() / RAND_MAX *
-                                    i_inter * NS_PER_SEC);
+                /* Next launch no sooner than i_inter seconds from now.
+                 * Add a small random bonus (0..i_inter) on top so launches
+                 * are not perfectly periodic, but the minimum gap is always
+                 * enforced by using i_inter as the base. */
+                unsigned long base_ns  = (unsigned long)(i_inter * NS_PER_SEC);
+                unsigned long bonus_ns = (unsigned long)((double)rand() / RAND_MAX * base_ns);
+                unsigned long interval_ns = base_ns + bonus_ns;
                 nextLaunchSec  = shm->seconds;
                 nextLaunchNano = shm->nanoseconds;
                 clock_add(&nextLaunchSec, &nextLaunchNano, interval_ns);
@@ -312,7 +331,7 @@ int main(int argc, char *argv[]) {
             int bSize = blockedQ.size;
             for (int b = 0; b < bSize; b++) {
                 int idx = q_pop(&blockedQ);
-                struct PCB *p = &shm->processTable[idx];
+                struct PCB *p = &processTable[idx];
                 if (clock_ge(shm->seconds, shm->nanoseconds,
                              (unsigned int)p->eventWaitSec,
                              (unsigned int)p->eventWaitNano)) {
@@ -336,7 +355,7 @@ int main(int argc, char *argv[]) {
             print_ready_queue(&readyQ);
 
             int idx = q_pop(&readyQ);
-            struct PCB *p = &shm->processTable[idx];
+            struct PCB *p = &processTable[idx];
 
             unsigned int dispatchSec  = shm->seconds;
             unsigned int dispatchNano = shm->nanoseconds;
@@ -445,17 +464,22 @@ int main(int argc, char *argv[]) {
             /* No processes anywhere — advance clock to next launch time */
             if (clock_ge(nextLaunchSec, nextLaunchNano,
                          shm->seconds, shm->nanoseconds)) {
-                unsigned long gap =
-                    ((unsigned long)(nextLaunchSec  - shm->seconds)) * NS_PER_SEC +
-                    (nextLaunchNano > shm->nanoseconds
-                         ? nextLaunchNano - shm->nanoseconds
-                         : 0);
+                /* Compute gap with nanosecond borrow */
+                unsigned long gap;
+                if (nextLaunchNano >= shm->nanoseconds) {
+                    gap = ((unsigned long)(nextLaunchSec - shm->seconds)) * NS_PER_SEC
+                          + (nextLaunchNano - shm->nanoseconds);
+                } else {
+                    gap = ((unsigned long)(nextLaunchSec - shm->seconds - 1)) * NS_PER_SEC
+                          + (NS_PER_SEC - shm->nanoseconds + nextLaunchNano);
+                }
                 if (gap > 0) {
                     clock_add(&shm->seconds, &shm->nanoseconds, gap);
                     totalOssNs += gap;
                 }
             } else {
-                /* Advance by a small amount to prevent busy-wait */
+                /* Already past launch time but still in this branch —
+                 * bump clock slightly to avoid a busy-wait spin */
                 unsigned long bump = 1000000UL;
                 clock_add(&shm->seconds, &shm->nanoseconds, bump);
                 totalOssNs += bump;
@@ -466,7 +490,7 @@ int main(int argc, char *argv[]) {
             unsigned int earliestNano = (unsigned int)-1;
             for (int b = 0; b < blockedQ.size; b++) {
                 int idx2 = blockedQ.data[(blockedQ.head + b) % MAX_PROCS];
-                struct PCB *p2 = &shm->processTable[idx2];
+                struct PCB *p2 = &processTable[idx2];
                 if (p2->eventWaitSec < (int)earliestSec ||
                     (p2->eventWaitSec == (int)earliestSec &&
                      p2->eventWaitNano < (int)earliestNano)) {
@@ -476,11 +500,14 @@ int main(int argc, char *argv[]) {
             }
             if (clock_ge(earliestSec, earliestNano,
                          shm->seconds, shm->nanoseconds)) {
-                unsigned long gap =
-                    ((unsigned long)(earliestSec  - shm->seconds)) * NS_PER_SEC +
-                    (earliestNano > shm->nanoseconds
-                         ? earliestNano - shm->nanoseconds
-                         : 0);
+                unsigned long gap;
+                if (earliestNano >= shm->nanoseconds) {
+                    gap = ((unsigned long)(earliestSec - shm->seconds)) * NS_PER_SEC
+                          + (earliestNano - shm->nanoseconds);
+                } else {
+                    gap = ((unsigned long)(earliestSec - shm->seconds - 1)) * NS_PER_SEC
+                          + (NS_PER_SEC - shm->nanoseconds + earliestNano);
+                }
                 if (gap > 0) {
                     clock_add(&shm->seconds, &shm->nanoseconds, gap);
                     totalOssNs += gap;
@@ -490,6 +517,7 @@ int main(int argc, char *argv[]) {
     } /* end main loop */
 
     /* Kill any remaining children */
+    signal(SIGTERM, SIG_IGN);
     kill(-getpgrp(), SIGTERM);
     while (waitpid(-1, NULL, WNOHANG) > 0) {}
 
